@@ -12,6 +12,8 @@ using namespace inet::units::values;
 LetApp::~LetApp() {
     cancelAndDelete(selfMsg);
     cancelAndDelete(cleanupMsg);
+    cancelAndDelete(dataMsg);
+    cancelAndDelete(unmarkMsg);
     if (connectionLine) {
         cCanvas *canvas = getParentModule()->getParentModule()->getCanvas();
         if (canvas) canvas->removeFigure(connectionLine);
@@ -25,7 +27,8 @@ void LetApp::initialize(int stage)
         localPort = par("localPort");
         destPort = par("destPort");
         destAddress = L3AddressResolver().resolve("224.0.0.1");
-        myId = getParentModule()->getId();
+
+        myId = getParentModule()->getIndex();
 
         mobility = check_and_cast<IMobility *>(getParentModule()->getSubmodule("mobility"));
 
@@ -37,18 +40,37 @@ void LetApp::initialize(int stage)
 
         selfMsg = new cMessage("sendHello");
         cleanupMsg = new cMessage("cleanup");
+        dataMsg = new cMessage("generateData");
+        unmarkMsg = new cMessage("unmarkColors");
 
         scheduleAt(simTime() + par("messageInterval") + uniform(0, 0.1), selfMsg);
         scheduleAt(simTime() + 0.5, cleanupMsg);
 
+        scheduleAt(simTime() + 10.0 + uniform(0, 2), dataMsg);
+
         connectionLine = new cLineFigure(("link_" + std::to_string(myId)).c_str());
         connectionLine->setLineStyle(cFigure::LINE_DOTTED);
         connectionLine->setLineColor(cFigure::RED);
-        connectionLine->setLineWidth(2);
-        connectionLine->setEndArrowhead(cFigure::ARROW_TRIANGLE);
         connectionLine->setVisible(false);
-        connectionLine->setZIndex(-1);
         getParentModule()->getParentModule()->getCanvas()->addFigure(connectionLine);
+
+        pdrSignal = registerSignal("pdr");
+        delaySignal = registerSignal("endToEndDelay");
+        hopCountSignal = registerSignal("hopCount");
+        clusterHeadLifetimeSignal = registerSignal("clusterHeadLifetime");
+        controlOverheadSignal = registerSignal("controlOverhead");
+        isClusterHeadSignal = registerSignal("isClusterHead");
+        clusterChangeRateSignal = registerSignal("clusterChangeRate");
+        clusterSizeSignal = registerSignal("clusterSize");
+        residualEnergySignal = registerSignal("residualEnergy");
+        throughputSignal = registerSignal("throughput");
+
+        roleStartTime = simTime();
+
+        cModule *host = getParentModule();
+        if (host->getSubmodule("energyStorage")) {
+            energyStorage = check_and_cast<inet::power::SimpleEpEnergyStorage*>(host->getSubmodule("energyStorage"));
+        }
     }
 }
 
@@ -56,35 +78,33 @@ void LetApp::handleMessage(cMessage *msg)
 {
     if (msg == selfMsg) {
         sendHelloPacket();
-        double interval = par("messageInterval").doubleValue();
-        scheduleAt(simTime() + interval + uniform(-0.01, 0.01), selfMsg);
+        scheduleAt(simTime() + par("messageInterval"), selfMsg);
     }
     else if (msg == cleanupMsg) {
         removeOldNeighbors();
         runClusteringLogic();
         scheduleAt(simTime() + 0.5, cleanupMsg);
     }
+    else if (msg == dataMsg) {
+        sendDataPacket();
+        scheduleAt(simTime() + uniform(0.5, 1.5), dataMsg);
+    }
+    else if (msg == unmarkMsg) {
+        resetNodeColors();
+    }
+    else if (strcmp(msg->getName(), "floodingTimer") == 0) {
+        Packet *pkt = (Packet *)msg->getContextPointer();
+        if (pkt) socket.sendTo(pkt, destAddress, destPort);
+        delete msg;
+    }
     else {
         socket.processMessage(msg);
     }
 }
 
-void LetApp::refreshDisplay() const {
-    if (!connectionLine || !connectionLine->isVisible()) return;
-
-    Coord myPos = mobility->getCurrentPosition();
-    cModule *leaderMod = getSimulation()->getModule(currentLeaderId);
-
-    if (leaderMod) {
-        auto leaderMobility = check_and_cast<IMobility*>(leaderMod->getSubmodule("mobility"));
-        Coord leaderPos = leaderMobility->getCurrentPosition();
-        connectionLine->setStart(cFigure::Point(myPos.x, myPos.y));
-        connectionLine->setEnd(cFigure::Point(leaderPos.x, leaderPos.y));
-    } else {
-        const_cast<cLineFigure*>(connectionLine)->setVisible(false);
-    }
-}
-
+// ------------------------------------------------------------------
+// CLUSTERING MANTIĞI (LET)
+// ------------------------------------------------------------------
 void LetApp::sendHelloPacket()
 {
     Coord pos = mobility->getCurrentPosition();
@@ -102,127 +122,96 @@ void LetApp::sendHelloPacket()
     helloPayload->setPositionY(pos.y);
     helloPayload->setSpeed(vel.length());
     helloPayload->setAngle(atan2(vel.y, vel.x));
+
     helloPayload->setChunkLength(B(64));
-
     packet->insertAtBack(helloPayload);
+
+    emit(controlOverheadSignal, (long)helloPayload->getChunkLength().get());
+
     socket.sendTo(packet, destAddress, destPort);
-}
-
-void LetApp::socketDataArrived(UdpSocket *socket, Packet *packet)
-{
-    auto helloMsg = packet->peekAtFront<LetHello>();
-    if (helloMsg) {
-        int nId = helloMsg->getSenderId();
-
-        Coord pos = mobility->getCurrentPosition();
-        Coord vel = mobility->getCurrentVelocity();
-        double let = calculateLET(pos.x, pos.y, vel.length(), atan2(vel.y, vel.x),
-                                  helloMsg->getPositionX(), helloMsg->getPositionY(),
-                                  helloMsg->getSpeed(), helloMsg->getAngle(), 250.0);
-
-        neighborTable[nId].letValue = let;
-        neighborTable[nId].theirWeight = helloMsg->getCurrentWeight();
-
-        neighborTable[nId].theirLeaderId = helloMsg->getCurrentLeaderId();
-
-        neighborTable[nId].lastSeen = simTime();
-    }
-    delete packet;
 }
 
 void LetApp::runClusteringLogic()
 {
-    // A. Kendi Ağırlığımı Hesapla
+    // 1. Ağırlık Hesabı
     myTotalWeight = 0.0;
     for (auto const& [id, data] : neighborTable) {
         double val = (data.letValue > 1000) ? 1000 : data.letValue;
         myTotalWeight += val;
     }
 
-    // B. En İyi Lider Adayını Bul
+    // 2. CH Seçimi
     bool iamStrongest = true;
     int bestNeighborId = -1;
     double maxScore = -1.0;
-
-    // Skor = Weight + (ID * epsilon)
-    // Bu sayede puanlar yakınsa bile bir sıralama oluşur.
     double myScore = myTotalWeight + (myId * 0.0001);
 
     for (auto const& [id, data] : neighborTable) {
         double neighborScore = data.theirWeight + (id * 0.0001);
-
         if (neighborScore > maxScore) {
             maxScore = neighborScore;
             bestNeighborId = id;
         }
-
-        if (neighborScore > myScore) {
-            iamStrongest = false;
-        }
+        if (neighborScore > myScore) iamStrongest = false;
     }
 
-    // --- C. DÖNGÜ (LOOP) KONTROLÜ - KRİTİK BÖLÜM ---
-    // Eğer ben birini (X) lider seçmeye niyetlendiysem (Member olacaksam),
-    // ama X de beni lider seçtiyse (Loop), bu durumu kırmalıyız.
+    // 3. Rol Atama
+    int oldRole = myRole;
+    int oldLeader = currentLeaderId;
 
-    if (!iamStrongest && bestNeighborId != -1) {
-        NeighborData& leaderData = neighborTable[bestNeighborId];
+    if (iamStrongest) {
+        myRole = ROLE_CH;
+        currentLeaderId = myId;
+    } else {
+        myRole = ROLE_MEMBER;
+        currentLeaderId = bestNeighborId;
 
-        // KONTROL: Liderim (bestNeighborId) beni mi takip ediyor?
-        if (leaderData.theirLeaderId == myId) {
-
-            // DÖNGÜ VAR! (A->B ve B->A)
-            // ÇÖZÜM: ID'si büyük olan sorumluluk alıp Lider (CH) olsun.
-            // Diğeri (ID'si küçük olan) ona uymak zorunda kalacak.
-
-            if (myId > bestNeighborId) {
-                iamStrongest = true; // Kararımı değiştiriyorum, Lider benim!
+        bool isGw = false;
+        for (auto const& [id, data] : neighborTable) {
+            if (id == currentLeaderId) continue;
+            if (data.role == ROLE_CH || (data.theirLeaderId != -1 && data.theirLeaderId != currentLeaderId)) {
+                isGw = true;
+                break;
             }
         }
+        if (isGw) myRole = ROLE_GATEWAY;
     }
 
-    // D. Rolü Ata
-    if (iamStrongest) {
-        myRole = 1; // CH
-        currentLeaderId = -1;
+    if (myRole != oldRole || currentLeaderId != oldLeader) {
+        if (oldRole == ROLE_CH) {
+            emit(clusterHeadLifetimeSignal, simTime() - roleStartTime);
+        }
+        emit(clusterChangeRateSignal, 1);
+        roleStartTime = simTime();
+    }
+
+    emit(isClusterHeadSignal, (myRole == ROLE_CH) ? 1 : 0);
+
+
+    if (myRole == ROLE_CH) {
+        int myClusterSize = 0;
+        for (auto const& [id, data] : neighborTable) {
+            if (data.theirLeaderId == myId) {
+                myClusterSize++;
+            }
+        }
+
+        emit(clusterSizeSignal, myClusterSize);
     } else {
-        myRole = 2; // Member
-        currentLeaderId = bestNeighborId;
+        emit(clusterSizeSignal, 0); // CH değilsem boyutum 0
+    }
+
+
+    if (energyStorage) {
+        double residual = energyStorage->getResidualEnergyCapacity().get();
+        emit(residualEnergySignal, residual);
+
+        if (residual <= 0) {
+
+        }
     }
 
     updateVisuals();
-}
-
-void LetApp::removeOldNeighbors()
-{
-    simtime_t timeout = 2.0;
-    for (auto it = neighborTable.begin(); it != neighborTable.end(); ) {
-        if (simTime() - it->second.lastSeen > timeout) {
-             it = neighborTable.erase(it);
-        } else {
-            ++it;
-        }
-    }
-}
-
-void LetApp::updateVisuals()
-{
-    auto displayString = getParentModule()->getDisplayString();
-
-    if (myRole == 1) { // CH
-        getParentModule()->getDisplayString().setTagArg("i", 1, "red");
-        getParentModule()->getDisplayString().setTagArg("r", 0, "150");
-        getParentModule()->getDisplayString().setTagArg("r", 4, "red");
-        connectionLine->setVisible(false);
-    } else { // Member
-        getParentModule()->getDisplayString().setTagArg("i", 1, "green");
-        getParentModule()->getDisplayString().setTagArg("r", 0, "");
-        if (currentLeaderId != -1) {
-            connectionLine->setVisible(true);
-        } else {
-            connectionLine->setVisible(false);
-        }
-    }
 }
 
 double LetApp::calculateLET(double xi, double yi, double vi, double thetai,
@@ -241,6 +230,175 @@ double LetApp::calculateLET(double xi, double yi, double vi, double thetai,
     return std::max(0.0, numerator / denominator);
 }
 
-void LetApp::finish() {
-    // Simülasyon bittiğinde yapılacak işlemler
+// ------------------------------------------------------------------
+// BASİTLEŞTİRİLMİŞ ROUTING (BACKBONE FLOODING)
+// ------------------------------------------------------------------
+
+void LetApp::sendDataPacket()
+{
+    if (currentLeaderId == -1 && myRole != ROLE_CH) return;
+
+    int destId = intuniform(0, getParentModule()->getParentModule()->par("numHosts").intValue() - 1);
+    if (destId == myId) return;
+
+    auto packet = new Packet("LetData");
+    auto dataPayload = makeShared<LetData>();
+
+    dataPayload->setSrcId(myId);
+    dataPayload->setDestId(destId);
+    dataPayload->setSeqId(mySeqNum++);
+    dataPayload->setHopCount(0);
+    dataPayload->setChunkLength(B(1000));
+    dataPayload->setCreationTime(simTime());
+
+    packet->insertAtBack(dataPayload);
+
+    std::string pktId = std::to_string(myId) + "_" + std::to_string(mySeqNum - 1);
+    seenPackets.insert(pktId);
+
+    socket.sendTo(packet, destAddress, destPort);
+    pktsSent++;
+}
+
+void LetApp::processDataPacket(Packet *packet)
+{
+    auto data = packet->peekAtFront<LetData>();
+    int destId = data->getDestId();
+    int srcId = data->getSrcId();
+    std::string pktId = std::to_string(srcId) + "_" + std::to_string(data->getSeqId());
+
+    if (seenPackets.find(pktId) != seenPackets.end()) {
+        delete packet;
+        return;
+    }
+    seenPackets.insert(pktId);
+
+    if (destId == myId) {
+        pktsReceived++;
+
+        long bits = packet->getBitLength();
+        totalBitsReceived += bits;
+
+        double currentThroughput = totalBitsReceived / simTime().dbl();
+        emit(throughputSignal, currentThroughput);
+
+
+        emit(pdrSignal, 1);
+        emit(hopCountSignal, data->getHopCount());
+        emit(delaySignal, simTime() - data->getCreationTime());
+
+        getParentModule()->bubble("ARRIVED!");
+        getParentModule()->getDisplayString().setTagArg("i", 1, "blue");
+
+        if (unmarkMsg->isScheduled()) {
+            cancelEvent(unmarkMsg);
+        }
+        scheduleAt(simTime() + 0.2, unmarkMsg);
+
+        delete packet;
+        return;
+    }
+
+    if (data->getHopCount() > 15) { delete packet; return; }
+
+    if (myRole == ROLE_MEMBER) {
+        delete packet;
+        return;
+    }
+
+
+    auto fwdPacket = packet->dup();
+    auto fwdData = fwdPacket->removeAtFront<LetData>();
+    fwdData->setHopCount(fwdData->getHopCount() + 1);
+    fwdPacket->insertAtFront(fwdData);
+
+    cMessage *timer = new cMessage("floodingTimer");
+    timer->setContextPointer(fwdPacket);
+    scheduleAt(simTime() + uniform(0.001, 0.010), timer);
+
+    delete packet;
+}
+
+
+void LetApp::socketDataArrived(UdpSocket *socket, Packet *packet)
+{
+    if (packet->getBitLength() == 0) { delete packet; return; }
+    auto chunk = packet->peekAtFront<Chunk>();
+
+    if (auto helloMsg = dynamicPtrCast<const LetHello>(chunk)) {
+        int nId = helloMsg->getSenderId();
+        if (nId == myId) { delete packet; return; }
+
+        Coord pos = mobility->getCurrentPosition();
+        Coord vel = mobility->getCurrentVelocity();
+        double mySpeed = vel.length();
+        double myAngle = (mySpeed < 0.001) ? 0.0 : atan2(vel.y, vel.x);
+
+        double let = calculateLET(pos.x, pos.y, mySpeed, myAngle,
+                                  helloMsg->getPositionX(), helloMsg->getPositionY(),
+                                  helloMsg->getSpeed(), helloMsg->getAngle(), 250.0);
+
+        neighborTable[nId].letValue = let;
+        neighborTable[nId].theirWeight = helloMsg->getCurrentWeight();
+        neighborTable[nId].theirLeaderId = helloMsg->getCurrentLeaderId();
+        neighborTable[nId].role = helloMsg->getRole();
+        neighborTable[nId].lastSeen = simTime();
+        delete packet;
+    }
+    else if (auto dataPkt = dynamicPtrCast<const LetData>(chunk)) {
+        processDataPacket(packet);
+    }
+    else {
+        delete packet;
+    }
+}
+
+void LetApp::removeOldNeighbors()
+{
+    simtime_t timeout = 2.0;
+    for (auto it = neighborTable.begin(); it != neighborTable.end(); ) {
+        if (simTime() - it->second.lastSeen > timeout) {
+             it = neighborTable.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+void LetApp::updateVisuals()
+{
+    std::string color = "green";
+    std::string roleTxt = "";
+    if (myRole == ROLE_CH) { color = "red"; roleTxt = "CH"; }
+    else if (myRole == ROLE_GATEWAY) { color = "yellow"; roleTxt = "GW"; }
+
+    getParentModule()->getDisplayString().setTagArg("i", 1, color.c_str());
+    getParentModule()->getDisplayString().setTagArg("t", 0, roleTxt.c_str());
+}
+
+void LetApp::resetNodeColors() { updateVisuals(); }
+
+void LetApp::refreshDisplay() const {
+    if (!connectionLine) return;
+    if ((myRole == ROLE_MEMBER || myRole == ROLE_GATEWAY) && currentLeaderId != -1) {
+        cModule *leaderMod = getParentModule()->getParentModule()->getSubmodule("host", currentLeaderId);
+        if (leaderMod) {
+            auto myMobility = check_and_cast<IMobility*>(getParentModule()->getSubmodule("mobility"));
+            auto leaderMobility = check_and_cast<IMobility*>(leaderMod->getSubmodule("mobility"));
+            connectionLine->setStart(cFigure::Point(myMobility->getCurrentPosition().x, myMobility->getCurrentPosition().y));
+            connectionLine->setEnd(cFigure::Point(leaderMobility->getCurrentPosition().x, leaderMobility->getCurrentPosition().y));
+            connectionLine->setVisible(true);
+        } else { connectionLine->setVisible(false); }
+    } else { connectionLine->setVisible(false); }
+}
+
+void LetApp::finish()
+{
+    recordScalar("PacketsSent", pktsSent);
+    recordScalar("PacketsReceived", pktsReceived);
+    if (pktsSent > 0) {
+        double ratio = (double)pktsReceived / pktsSent;
+        recordScalar("PDR", ratio);
+        emit(pdrSignal, (long)(ratio * 100));
+    }
 }
